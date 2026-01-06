@@ -8,6 +8,8 @@ from dsa_structures.utils import DataHandler
 from dsa_structures.routes import RouteManager
 from dsa_structures.linked_list import LinkedList
 from dsa_structures.passenger_routes import PassengerBookingSystem
+from dsa_structures.stops import BusStopManager
+from dsa_structures.action_history import ActionHistory
 import heapq
 from datetime import time, timedelta
 import uuid
@@ -116,6 +118,9 @@ ADMIN_PHONE = "0000000000"
 
 routes_file = os.path.join(data_dir, 'routes.json')
 route_manager = RouteManager(routes_file)
+stops_file = os.path.join(data_dir, 'stops.json')
+stop_manager = BusStopManager(stops_file)
+action_history = ActionHistory()
 
 
 def _sim_init_file():
@@ -821,6 +826,7 @@ def calculate_next_arrival(bus, current_time):
 
 # Initialize booking system
 booking_system = PassengerBookingSystem()
+booking_system.sync_passengers(user_manager.get_all_users())
 
 # ==================== FLASK ROUTES ====================
 
@@ -922,6 +928,7 @@ def signup():
                 password=password,
                 role=role
             )
+            booking_system.sync_passengers(user_manager.get_all_users())
             
             flash('Account created successfully! Please login.', 'success')
             return redirect(url_for('login'))
@@ -1576,6 +1583,8 @@ def create_route():
         
         # Create new route
         route = route_manager.create_route(route_name)
+        action_history.record("route_created", {"route_id": route.route_id})
+        booking_system.refresh_routes()
         
         return jsonify({
             'success': True,
@@ -1598,6 +1607,8 @@ def create_route():
 
 @app.route('/api/routes/<route_id>/add_stop', methods=['POST'])
 def add_stop_to_route(route_id):
+    if not session.get('logged_in') or session.get('user_type') != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 401
     try:
         print(f"\n=== DEBUG START ===")
         print(f"Route ID from request: '{route_id}'")
@@ -1638,6 +1649,14 @@ def add_stop_to_route(route_id):
         
         # Call add_stop
         result = route_manager.add_stop(route_id, stop_data, position)
+        action_history.record(
+            "stop_added",
+            {
+                "route_id": route_id,
+                "stop_id": result.get("stop_id"),
+            },
+        )
+        booking_system.refresh_routes()
         
         print(f"\nSuccess! Stop added: {stop_name}")
         print("=== DEBUG END ===\n")
@@ -1664,8 +1683,18 @@ def remove_stop_from_route(route_id, position):
         return jsonify({'error': 'Unauthorized'}), 401
     
     try:
+        removed_stop_snapshot = route_manager.get_stop_data(route_id, position)
         # Remove stop from route
         removed_stop = route_manager.remove_stop(route_id, position)
+        action_history.record(
+            "stop_removed",
+            {
+                "route_id": route_id,
+                "position": position,
+                "stop_data": removed_stop_snapshot,
+            },
+        )
+        booking_system.refresh_routes()
         
         return jsonify({
             'success': True,
@@ -1686,6 +1715,7 @@ def update_stop_in_route(route_id, position):
     
     try:
         data = request.json
+        previous_stop = route_manager.get_stop_data(route_id, position)
         updated_data = {
             'stop_name': data.get('stop_name', '').strip(),
             'wait_time': data.get('wait_time'),
@@ -1696,6 +1726,15 @@ def update_stop_in_route(route_id, position):
         
         # Update stop in route
         updated_stop = route_manager.update_stop(route_id, position, updated_data)
+        action_history.record(
+            "stop_updated",
+            {
+                "route_id": route_id,
+                "position": position,
+                "previous_stop": previous_stop,
+            },
+        )
+        booking_system.refresh_routes()
         
         return jsonify({
             'success': True,
@@ -1721,8 +1760,17 @@ def reorder_route_stops(route_id):
         if not new_order:
             return jsonify({'error': 'New order array is required'}), 400
         
+        previous_stops = route_manager.get_route(route_id).get('stops', [])
         # Reorder stops
         updated_route = route_manager.reorder_stops(route_id, new_order)
+        action_history.record(
+            "stops_reordered",
+            {
+                "route_id": route_id,
+                "previous_stops": [item.get('data', item) for item in previous_stops],
+            },
+        )
+        booking_system.refresh_routes()
         
         return jsonify({
             'success': True,
@@ -1742,8 +1790,11 @@ def delete_route(route_id):
         return jsonify({'error': 'Unauthorized'}), 401
     
     try:
+        route_snapshot = route_manager.serialize_route(route_id)
         # Delete route
         success = route_manager.delete_route(route_id)
+        action_history.record("route_deleted", {"route_data": route_snapshot})
+        booking_system.refresh_routes()
         
         return jsonify({
             'success': True,
@@ -1846,6 +1897,133 @@ def get_route_details(route_id):
         print(f"ERROR in get_route_details: {e}")
         import traceback
         traceback.print_exc()
+        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
+
+# ==================== BUS STOP MANAGEMENT ROUTES ====================
+
+@app.route('/admin/api/stops', methods=['GET'])
+def get_all_stops():
+    """API to get all city stops"""
+    if not session.get('logged_in') or session.get('user_type') != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 401
+    return jsonify({
+        'success': True,
+        'stops': stop_manager.get_all_stops()
+    })
+
+@app.route('/admin/api/stops', methods=['POST'])
+def create_stop():
+    """API to create a city stop"""
+    if not session.get('logged_in') or session.get('user_type') != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 401
+    try:
+        data = request.json or {}
+        stop = stop_manager.add_stop(data)
+        action_history.record("stop_created", {"stop_id": stop.get("stop_id")})
+        return jsonify({'success': True, 'stop': stop})
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
+
+@app.route('/admin/api/stops/<stop_id>', methods=['DELETE'])
+def delete_stop(stop_id):
+    """API to delete a city stop"""
+    if not session.get('logged_in') or session.get('user_type') != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 401
+    try:
+        removed = stop_manager.remove_stop(stop_id)
+        action_history.record("stop_deleted", {"stop_data": removed})
+        return jsonify({'success': True, 'removed': removed})
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
+
+@app.route('/admin/api/stops/assign', methods=['POST'])
+def assign_stop_to_route():
+    """API to assign a stop to a route"""
+    if not session.get('logged_in') or session.get('user_type') != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 401
+    try:
+        data = request.json or {}
+        route_id = data.get('route_id')
+        stop_id = data.get('stop_id')
+        position = data.get('position')
+        if not route_id or not stop_id:
+            return jsonify({'error': 'route_id and stop_id are required'}), 400
+        assigned = stop_manager.assign_stop_to_route(route_manager, route_id, stop_id, position)
+        action_history.record(
+            "stop_assigned",
+            {
+                "route_id": route_id,
+                "stop_id": assigned.get("stop_id"),
+            },
+        )
+        booking_system.refresh_routes()
+        return jsonify({'success': True, 'stop': assigned})
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
+
+# ==================== TICKET & PASSENGER MONITORING ====================
+
+@app.route('/admin/api/tickets/verify/<ticket_id>', methods=['GET'])
+def verify_ticket(ticket_id):
+    """API to verify ticket"""
+    if not session.get('logged_in') or session.get('user_type') != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 401
+    result = booking_system.verify_ticket(ticket_id)
+    return jsonify(result)
+
+@app.route('/admin/api/tickets/duplicates', methods=['GET'])
+def detect_duplicate_tickets():
+    """API to detect duplicate tickets"""
+    if not session.get('logged_in') or session.get('user_type') != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 401
+    return jsonify(booking_system.detect_duplicate_tickets())
+
+@app.route('/admin/api/passengers/<passenger_id>', methods=['GET'])
+def search_passenger(passenger_id):
+    """API to search passenger by ID"""
+    if not session.get('logged_in') or session.get('user_type') != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 401
+    passenger = booking_system.search_passenger(passenger_id)
+    if not passenger:
+        return jsonify({'error': 'Passenger not found'}), 404
+    return jsonify({'success': True, 'passenger': passenger})
+
+# ==================== ACTION HISTORY / UNDO ====================
+
+@app.route('/admin/api/actions/undo', methods=['POST'])
+def undo_last_action():
+    """API to undo last action"""
+    if not session.get('logged_in') or session.get('user_type') != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 401
+    try:
+        result = action_history.undo_last(route_manager, stop_manager)
+        booking_system.refresh_routes()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+# ==================== ANALYTICS / REPORTS ====================
+
+@app.route('/admin/api/analytics', methods=['GET'])
+def admin_analytics():
+    """API to get admin analytics"""
+    if not session.get('logged_in') or session.get('user_type') != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 401
+    try:
+        top_k = request.args.get('top_k', 5)
+        try:
+            top_k = int(top_k)
+        except (TypeError, ValueError):
+            top_k = 5
+        analytics = booking_system.get_admin_analytics(top_k=top_k)
+        return jsonify({'success': True, 'analytics': analytics})
+    except Exception as e:
         return jsonify({'error': f'Internal server error: {str(e)}'}), 500
 
 # ==================== PASSENGER BOOKING ROUTES ====================

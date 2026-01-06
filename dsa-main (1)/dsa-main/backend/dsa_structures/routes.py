@@ -462,6 +462,81 @@ class RouteManager:
         
         print(f"Reordered {len(route)} stops in route '{route.route_name}'")
         return route.display()
+
+    def replace_stops(self, route_id, stops_list):
+        """Replace route stops with a new ordered list."""
+        route = self.routes.get(route_id)
+        if not route:
+            raise ValueError(f"Route with ID {route_id} not found")
+
+        route.clear()
+        for stop in stops_list:
+            route.add_last(stop)
+        self.save_routes()
+        return route.display()
+
+    def get_stop_position(self, route_id, stop_id):
+        """Get position for a stop ID in a route."""
+        route = self.routes.get(route_id)
+        if not route:
+            raise ValueError(f"Route with ID {route_id} not found")
+        _, position = route.find_stop(stop_id)
+        return position
+
+    def get_stop_data(self, route_id, position):
+        """Get stop data at a position."""
+        route = self.routes.get(route_id)
+        if not route:
+            raise ValueError(f"Route with ID {route_id} not found")
+        return route.get_at(position)
+
+    def has_stop_name(self, route_id, stop_name):
+        """Check if route already contains a stop name (case-insensitive)."""
+        route = self.routes.get(route_id)
+        if not route:
+            raise ValueError(f"Route with ID {route_id} not found")
+        target = (stop_name or "").strip().lower()
+        current = route.head
+        while current:
+            if current.data.get('stop_name', '').strip().lower() == target:
+                return True
+            current = current.next
+        return False
+
+    def serialize_route(self, route_id):
+        """Serialize a route to dict for undo/restore."""
+        route = self.routes.get(route_id)
+        if not route:
+            raise ValueError(f"Route with ID {route_id} not found")
+        return {
+            "route_id": route.route_id,
+            "route_name": route.route_name,
+            "headway_minutes": getattr(route, "headway_minutes", DEFAULT_SERVICE_CALENDAR["weekday"]["headway_minutes"]),
+            "service_calendar": getattr(route, "service_calendar", _merge_service_calendar({})),
+            "stops": route.to_list(),
+        }
+
+    def restore_route(self, route_data):
+        """Restore a deleted route from serialized data."""
+        route_id = route_data.get("route_id")
+        route_name = route_data.get("route_name")
+        if not route_id or not route_name:
+            raise ValueError("Invalid route data for restore")
+        if route_id in self.routes:
+            raise ValueError("Route already exists")
+        if route_name in self.route_names:
+            raise ValueError("Route name already exists")
+
+        route = self._create_route_from_data(route_data)
+        route.route_id = route_id
+        route.route_name = route_name
+        route.headway_minutes = route_data.get("headway_minutes", DEFAULT_SERVICE_CALENDAR["weekday"]["headway_minutes"])
+        route.service_calendar = _merge_service_calendar(route_data.get("service_calendar"))
+
+        self.routes[route_id] = route
+        self.route_names[route_name] = route_id
+        self.save_routes()
+        return route
     
     def get_route(self, route_id):
         """Get route by ID"""

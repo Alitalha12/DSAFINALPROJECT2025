@@ -12,6 +12,7 @@ from dataclasses import dataclass, asdict
 from typing import Optional, List, Dict, Any
 import heapq
 from collections import deque
+from .users import HashTable
 
 # ===================== DATA STRUCTURES =====================
 
@@ -407,6 +408,8 @@ class PassengerBookingSystem:
         self.transport_graph = TransportGraph()
         self.ticket_queue = TicketPriorityQueue()
         self.booking_history = BookingHistory()
+        self.ticket_index = HashTable()
+        self.duplicate_tickets = {}
         
         # Load data
         self.buses = self._load_json(buses_file)
@@ -420,6 +423,7 @@ class PassengerBookingSystem:
         
         # Load existing tickets
         self.tickets = self._load_tickets()
+        self._build_ticket_index()
         
         # Booked seats tracking
         self.booked_seats = {}  # {bus_number_date: set(seat_numbers)}
@@ -451,6 +455,8 @@ class PassengerBookingSystem:
                 return json.load(f)
         except FileNotFoundError:
             return {'tickets': [], 'next_id': 1000}
+        except json.JSONDecodeError:
+            return {'tickets': [], 'next_id': 1000}
     
     def _save_tickets(self) -> bool:
         """Save tickets to file"""
@@ -461,6 +467,23 @@ class PassengerBookingSystem:
         except Exception as e:
             print(f"Error saving tickets: {e}")
             return False
+
+    def _build_ticket_index(self) -> None:
+        """Build hash table index for tickets and detect duplicates."""
+        self.ticket_index = HashTable()
+        self.duplicate_tickets = {}
+        tickets = self.tickets.get('tickets', [])
+        for ticket in tickets:
+            ticket_id = ticket.get('ticket_id')
+            if not ticket_id:
+                continue
+            if self.ticket_index.exists(ticket_id):
+                existing = self.ticket_index.get(ticket_id)
+                if ticket_id not in self.duplicate_tickets:
+                    self.duplicate_tickets[ticket_id] = [existing]
+                self.duplicate_tickets[ticket_id].append(ticket)
+            else:
+                self.ticket_index.insert(ticket_id, ticket)
     
     def _build_transport_graph(self) -> None:
         """Build transport graph from routes data"""
@@ -499,6 +522,30 @@ class PassengerBookingSystem:
                     distance=5.0,  # Estimated 5km between stops
                     time_minutes=5 + wait_time
                 )
+
+    def refresh_routes(self) -> None:
+        """Reload routes and rebuild graph after admin updates."""
+        self.routes = self._load_json(self.routes_file)
+        self.transport_graph = TransportGraph()
+        self._build_transport_graph()
+
+    def sync_passengers(self, passengers: List[Dict]) -> None:
+        """Sync passengers into BST for admin lookup."""
+        self.passenger_bst = PassengerBST()
+        for passenger in passengers:
+            passenger_id = passenger.get('user_id') or passenger.get('passenger_id')
+            if not passenger_id:
+                continue
+            passenger_record = {
+                'passenger_id': passenger_id,
+                'full_name': passenger.get('full_name', ''),
+                'email': passenger.get('email', ''),
+                'phone': passenger.get('phone', ''),
+                'role': passenger.get('role', 'passenger'),
+                'created_at': passenger.get('created_at'),
+                'last_login': passenger.get('last_login'),
+            }
+            self.passenger_bst.insert(passenger_id, passenger_record)
     
     # ===================== PASSENGER MANAGEMENT =====================
     def register_passenger(self, passenger_data: Dict) -> Dict:
@@ -869,6 +916,7 @@ class PassengerBookingSystem:
         
         self.tickets['tickets'].append(ticket_dict)
         self.tickets['next_id'] = self.ticket_counter
+        self.ticket_index.insert(ticket_id, ticket_dict)
         
         # Add to booking history (Linked List)
         self.booking_history.add_booking(ticket_dict)
@@ -1013,6 +1061,7 @@ Important:
                 break
         
         if ticket_found:
+            self._build_ticket_index()
             self._save_tickets()
             return {'success': True, 'message': 'Ticket cancelled successfully'}
         
@@ -1020,9 +1069,9 @@ Important:
     
     def get_ticket_details(self, ticket_id: str) -> Optional[Dict]:
         """Get details of a specific ticket"""
-        for ticket in self.tickets.get('tickets', []):
-            if ticket['ticket_id'] == ticket_id:
-                return ticket
+        ticket = self.ticket_index.get(ticket_id)
+        if ticket:
+            return ticket
         
         return None
     
@@ -1039,6 +1088,24 @@ Important:
     def get_priority_ticket(self) -> Optional[Dict]:
         """Get highest priority ticket"""
         return self.ticket_queue.peek()
+
+    def verify_ticket(self, ticket_id: str) -> Dict:
+        """Verify a ticket using hash table lookup."""
+        ticket = self.ticket_index.get(ticket_id)
+        if not ticket:
+            return {'valid': False, 'message': 'Ticket not found'}
+        if ticket.get('status') != 'confirmed':
+            return {'valid': False, 'message': f"Ticket status is {ticket.get('status')}", 'ticket': ticket}
+        if ticket_id in self.duplicate_tickets:
+            return {'valid': False, 'message': 'Duplicate ticket detected', 'ticket': ticket}
+        return {'valid': True, 'message': 'Ticket verified', 'ticket': ticket}
+
+    def detect_duplicate_tickets(self) -> Dict:
+        """Return duplicate tickets detected in the system."""
+        duplicates = []
+        for ticket_id, tickets in self.duplicate_tickets.items():
+            duplicates.append({'ticket_id': ticket_id, 'entries': tickets, 'count': len(tickets)})
+        return {'duplicates': duplicates, 'total_duplicates': len(duplicates)}
     
     # ===================== STATISTICS =====================
     def get_system_statistics(self) -> Dict:
@@ -1062,4 +1129,36 @@ Important:
             'booking_history_size': self.booking_history.size,
             'transport_nodes': len(self.transport_graph.nodes),
             'average_fare': round(total_revenue / active_tickets, 2) if active_tickets > 0 else 0
+        }
+
+    def get_admin_analytics(self, top_k: int = 5) -> Dict:
+        """Generate analytics for busiest stops and route usage."""
+        stop_counts = {}
+        route_counts = {}
+        passenger_counts = {}
+
+        for ticket in self.tickets.get('tickets', []):
+            if ticket.get('status') != 'confirmed':
+                continue
+            route_name = ticket.get('route_name') or ticket.get('route_id', 'Unknown')
+            route_counts[route_name] = route_counts.get(route_name, 0) + 1
+
+            for stop in (ticket.get('from_stop'), ticket.get('to_stop')):
+                if stop:
+                    stop_counts[stop] = stop_counts.get(stop, 0) + 1
+
+            passenger_id = ticket.get('passenger_id')
+            if passenger_id:
+                passenger_counts[passenger_id] = passenger_counts.get(passenger_id, 0) + 1
+
+        busiest = heapq.nlargest(top_k, stop_counts.items(), key=lambda x: x[1])
+        busiest_stops = [{'stop_name': name, 'count': count} for name, count in busiest]
+
+        route_usage = [{'route_name': name, 'count': count} for name, count in route_counts.items()]
+        passenger_usage = [{'passenger_id': pid, 'count': count} for pid, count in passenger_counts.items()]
+
+        return {
+            'busiest_stops': busiest_stops,
+            'route_usage': route_usage,
+            'passenger_counts': passenger_usage,
         }
